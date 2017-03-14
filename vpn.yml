@@ -1,0 +1,104 @@
+---
+heat_template_version: 2015-04-30
+
+description: Deploy a Strongswan VPN
+
+parameters:
+  private-network:
+    description: The network you want the VPN to give you access to
+    label: Private network
+    type: string
+  public-network:
+    description: The network where your floating IP lives
+    label: Public network
+    type: string
+  user:
+    description: User name you want to use for VPN' config
+    label: User
+    type: string
+  password:
+    description: Password you want to use
+    label: Password
+    type: string
+    hidden: true
+  flavor:
+    description: The flavor for the VPN' VM
+    label: Flavor
+    type: string
+  image:
+    description: The image for the VPN' VM
+    label: Image
+    type: string
+
+resources:
+  setup_strongswan:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config:
+        str_replace:
+          template: |
+            #!/bin/sh
+            echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+            sysctl -p /etc/sysctl.conf
+            iptables -t nat -I POSTROUTING -j MASQUERADE
+            dhclient
+            apt-get -y install strongswan
+            cat > /etc/ipsec.conf << EOF
+            config setup
+              uniqueids=no
+
+            conn %default
+              ikelifetime=60m
+              keylife=20m
+              rekeymargin=3m
+              keyingtries=1
+              keyexchange=ikev2
+              authby=secret
+
+            conn nat-t
+              left=%defaultroute
+              leftsubnet=$cidr
+              leftfirewall=yes
+              right=%any
+              rightsubnet=0.0.0.0/0
+              auto=start
+            EOF
+
+            echo "$user : PSK \"$password\"" > /etc/ipsec.secrets
+            chmod 600 /etc/ipsec.secrets
+            ipsec restart
+          params:
+            $cidr: {get_attr: [vpngw_port, subnets, 0, cidr]}
+            $user: {get_param: user}
+            $password: {get_param: password}
+
+  vpngw_port:
+    type: OS::Neutron::Port
+    properties:
+      network: {get_param: private-network}
+
+  vpngw:
+    type: OS::Nova::Server
+    properties:
+      image: {get_param: image}
+      flavor: {get_param: flavor}
+      user_data_format: RAW
+      user_data: {get_resource: setup_strongswan}
+      networks:
+        - port: {get_resource: vpngw_port}
+
+  vpngw_public_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: public-network}
+
+  fip_association:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: {get_resource: vpngw_public_ip}
+      port_id: {get_resource: vpngw_port}
+
+  outputs:
+  floating_ip:
+    description: Floating ip of your VPN
+    value: {get_attr: [vpngw_public_ip, floating_ip_address]}
